@@ -155,6 +155,15 @@ Programme :
 
 ---
 
+## Captures d’écran
+
+### Exemple 1 : Bonjour / Alice
+![Exemple 1](Assets/capture1.png)
+
+### Exemple 2 : Arduino
+![Exemple 2](Assets/capture2.png)
+
+
 ## Licence
 Projet ouvert à des fins pédagogiques.  
 Élaboré avec l’assistance de **ChatGPT (OpenAI)**.
