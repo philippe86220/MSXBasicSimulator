@@ -150,7 +150,6 @@ Programme :
 ### 7. Limitations connues
 - Pas de `STOP` (qui sur MSX permettait BREAK + reprise CONT).
 - Pas de graphismes ni de son.
-- `^` associatif à gauche au lieu de droite.
 
 ---
 
