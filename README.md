@@ -86,7 +86,6 @@ Ok
 
 ### Différences avec MSX BASIC 1.0
 - Tous les nombres sont représentés en `Double` (pas de `SINGLE`/`INTEGER`).  
-- `^` est **gauche-associatif** (`2^3^2 = 64` au lieu de 512 sur MSX).  
 - `PRINT` : zones de 14 colonnes, espace de signe pour positifs.  
 - `CLEAR` : autorise un re-`DIM` unique après exécution.  
 - `CLOAD`/`SAVE` : sauvegarde fichiers `.bas` dans le système local.  
