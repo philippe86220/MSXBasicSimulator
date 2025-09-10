@@ -1,10 +1,16 @@
-# MSXBasicSimulator
+
 
 ![Swift](https://img.shields.io/badge/Swift-6.1-orange?logo=swift&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS-15.5+-blue?logo=apple&logoColor=white)
 ![License](https://img.shields.io/badge/Licence-MIT-green)
 
 # MSXBasicSimulator
+
+## Sommaire
+- [Résumé](#résumé)
+- [Annexe technique](#annexe-technique-fonctionnement-interne-détaillé)
+- [Captures d’écran](#captures-décran)
+- [Licence](#licence)
 
 ## Résumé
 
