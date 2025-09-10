@@ -2477,7 +2477,7 @@ class BasicInterpreter: ObservableObject  {
                 }
             }
         }
-        // 10.55) Exponentiation ^ (associativité GAUCHE, plus prioritaire que * / MOD)
+        // 10.56) Exponentiation ^ (associativité GAUCHE, plus prioritaire que * / MOD)
         if let parts = splitTopLevelByCaret(cleanedExpr), parts.count > 1 {
             let MSX_MAX: Double = 1.7014118e38
             func toDouble(_ s: String) -> (ok: Bool, val: Double, err: String?) {
