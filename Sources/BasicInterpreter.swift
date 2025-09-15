@@ -1,6 +1,11 @@
 import Foundation
 
 class BasicInterpreter: ObservableObject  {
+    // Rejouer la suite du THEN/ELSE après un RETURN issu d'un GOSUB dans un IF
+    private var pendingInline: [String]? = nil
+    private var pendingInlineDepth: Int? = nil
+
+    
     let program: BasicProgram
     var variables: [String: Double] = [:]
     var inputVariable: String?
@@ -14,7 +19,8 @@ class BasicInterpreter: ObservableObject  {
     private var rndLast: Double = 0.5
 
     private let CLS_MARKER = "__CLS__"
-    private var deferredEnd = false
+    //private var deferredEnd = false
+    private var deferredControl: String? = nil
     private var deferredEndFromMultiStmt = false
     var userFunctions: [String: (params: [String], body: String)] = [:]
     var userStringFunctions: [String: (params: [String], body: String)] = [:]
@@ -36,6 +42,57 @@ class BasicInterpreter: ObservableObject  {
     @Published var nomFichierCharge: String? = nil
     
     private var fnExpandDepth = 0
+    
+    //MARK: - TIME
+    private func readTIME() -> Int { readTimeSeconds() }
+    private func writeTIME(_ seconds: Int) { setTimeSeconds(seconds) }
+
+    // État
+    private var clockBaseWall: Date = Date()
+    private var baseSeconds: Int = 0 // 0..86399
+
+    // Utilitaires
+    private func nowSecondsSinceBase() -> Int {
+        let elapsed = max(0, Int(Date().timeIntervalSince(clockBaseWall)))
+        return (baseSeconds + elapsed) % 86400
+    }
+
+    // LECTURE
+    private func readTimeSeconds() -> Int { nowSecondsSinceBase() }
+    private func readTimeString() -> String {
+        let t = readTimeSeconds()
+        let h = t / 3600
+        let m = (t % 3600) / 60
+        let s = t % 60
+        return String(format: "%02d:%02d:%02d", h, m, s)
+    }
+
+    // ÉCRITURE
+    private func setTimeSeconds(_ seconds: Int) {
+        let s = ((seconds % 86400) + 86400) % 86400
+        baseSeconds = s
+        clockBaseWall = Date()
+    }
+
+    @discardableResult
+    private func setTimeString(_ hhmmss: String) -> Bool {
+        let parts = hhmmss.split(separator: ":")
+        guard parts.count == 3,
+              let h = Int(parts[0]), (0...23).contains(h),
+              let m = Int(parts[1]), (0...59).contains(m),
+              let s = Int(parts[2]), (0...59).contains(s) else { return false }
+        setTimeSeconds(h*3600 + m*60 + s)
+        return true
+    }
+
+    // Reset horloge (à appeler depuis clearAllUserState)
+    private func resetClockFromSystem() {
+        let c = Calendar.current.dateComponents([.hour,.minute,.second], from: Date())
+        let h = c.hour ?? 0, m = c.minute ?? 0, s = c.second ?? 0
+        baseSeconds = ((h*3600 + m*60 + s) % 86400 + 86400) % 86400
+        clockBaseWall = Date()
+    }
+
 
     // MARK: - DATA / READ
     var dataPool: [String] = []
@@ -141,21 +198,7 @@ class BasicInterpreter: ObservableObject  {
         print(pad + s())
     }
     
-    //TIME
-    // --- MSX TIME (ticks) ---
-    private var timeTicksPerSec: Double = 50.0   // PAL; mets 60.0 si tu veux NTSC
-    private var timeSetMoment: Date = Date()     // moment de la dernière affectation de TIME
-    private var timeSetOffset: Int = 0           // valeur de TIME au moment de l’affectation
-
-    private func readTIME() -> Int {
-        let elapsed = Date().timeIntervalSince(timeSetMoment) // secondes
-        let ticks = Int(floor(elapsed * timeTicksPerSec))
-        return timeSetOffset + ticks
-    }
-    private func writeTIME(_ value: Int) {
-        timeSetOffset = value
-        timeSetMoment = Date()
-    }
+    
 
     // --- Throttle (émulation vitesse MSX) ---
     var msxThrottle: Bool = false
@@ -283,6 +326,7 @@ class BasicInterpreter: ObservableObject  {
 
                     let arrName = String(n[nameR]).uppercased()
                     let inside  = String(n[idxR])
+                    consumeRedimAllowanceIfNeeded(arrName)
                     guard let idxs = parseIndicesList(inside) else { return "Syntax error" }
                     guard let dims = arrayDims[arrName], var arr = arrays[arrName] else { return "Undimensioned array" }
                     guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { return "Subscript out of range" }
@@ -302,6 +346,7 @@ class BasicInterpreter: ObservableObject  {
 
                     let arrName = String(n[nameR]).uppercased()
                     let inside  = String(n[idxR])
+                    consumeRedimAllowanceIfNeeded(arrName)
                     guard let idxs = parseIndicesList(inside) else { return "Syntax error" }
                     guard let dims = stringArrayDims[arrName], var arr = stringArrays[arrName] else { return "Undimensioned array" }
                     guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { return "Subscript out of range" }
@@ -414,6 +459,13 @@ class BasicInterpreter: ObservableObject  {
         }
     }
     
+    func dumpGosubStack(_ whereTag: String) {
+        let s = gosubStack
+            .map { "(\($0.lineIndex), next=\(String(describing: $0.nextStmtIndex)))" }
+            .joined(separator: " -> ")
+        elog("[GOSUB-STACK \(whereTag)] \(s)")
+    }
+
 
 
     // MARK: - Exécution de programme
@@ -425,6 +477,10 @@ class BasicInterpreter: ObservableObject  {
         if resumeIndex == nil {
             clearAllUserState("RUN start")
             rebuildDataPoolFromProgram()
+            deferredControl = nil
+            pendingInline = nil
+            pendingInlineDepth = nil
+
             elog("[runProgram] Réinitialisation complète")
         } else {
             elog("[runProgram] Reprise depuis resumeIndex = \(resumeIndex!)")
@@ -444,46 +500,75 @@ class BasicInterpreter: ObservableObject  {
                 continue
             }
 
+            elog("[runProgram] ➟ index=\(index) line=\(lineNumber) resumeStmtIdx=\(String(describing: resumeStatementIndex))")
+
             let trimmedContent = content.trimmingCharacters(in: .whitespaces)
             let u = trimmedContent.uppercased()
-            // IF et REM ne sont pas splittés par ':'
-            let statements: [String] = {
-                if u.hasPrefix("IF ") {
-                    elog("[runProgram] IF-line détectée -> pas de split ':'")
-                    return [trimmedContent]
-                } else if u.hasPrefix("REM") {
-                    elog("[runProgram] REM-line détectée -> pas de split ':'")
-                    return [trimmedContent]
-                } else {
-                    return splitStatements(trimmedContent)
-                }
-            }()
 
-            var sidx = 0
-            if let rs = resumeStatementIndex { sidx = rs; resumeStatementIndex = nil }
-            if let fs = forcedStatementIndex  { sidx = fs; forcedStatementIndex  = nil }
+        // --- NEW: savoir si la ligne est mono-instruction (pas de split ':')
+        let isMonoNoSplit = u.hasPrefix("IF ") || u.hasPrefix("REM")
+
+        // IF & REM: pas de split par ':'
+        let statements: [String] = {
+            if u.hasPrefix("IF ") {
+                elog("[runProgram] IF-line détectée -> pas de split ':'")
+                return [trimmedContent]
+            } else if u.hasPrefix("REM") {
+                elog("[runProgram] REM-line détectée -> pas de split ':'")
+                return [trimmedContent]
+            } else {
+                return splitStatements(trimmedContent)
+            }
+        }()
+
+        // --- GUARD: si on reprend après un INPUT et que le pointeur de statement
+        // est au-delà du dernier statement de la ligne, on passe à la ligne suivante.
+        if let rs = resumeStatementIndex {
+            let stmtsCount = statements.count
+            if rs >= stmtsCount {
+                elog("[runProgram] resumeStmtIdx=\(rs) >= \(stmtsCount) -> avancer à la ligne suivante")
+                resumeStatementIndex = nil
+                resumeIndex = nil
+                index += 1
+                continue outer
+            }
+        }
+
+        // --- NEW: calcul de sidx tenant compte de resumeStatementIndex
+        var sidx = 0
+        if let rs = resumeStatementIndex {
+            if isMonoNoSplit {
+                sidx = 0
+            } else {
+                sidx = min(rs, max(0, statements.count - 1))
+            }
+            resumeStatementIndex = nil
+        }
+
+            if let fs = forcedStatementIndex  {
+                sidx = fs
+                forcedStatementIndex  = nil
+            }
+        //if let fs = forcedStatementIndex  {
+           // sidx = min(max(0, fs), max(0, statements.count - 1))  // <-- borne
+            //forcedStatementIndex  = nil
+       // }
 
             while sidx < statements.count {
                 let stmt = statements[sidx]
                 let stmtUpper = stmt.trimmingCharacters(in: .whitespaces).uppercased()
                 let result = interpretImmediate(stmt, isInRun: true)
 
-                // ⛔️ Arrêt immédiat en cas d'erreur fatale (format: "<msg> in <line>")
+                // Si interpretImmediate a déjà géré le retour, NE PAS re-pop !
+                
+
+
+                // Erreurs fatales (format MSX "<msg> in <line>")
                 let fatalErrors: Set<String> = [
-                    "Syntax error",
-                    "Duplicate parameter name",
-                    "Incorrect number of arguments",
-                    "Illegal function call",
-                    "Subscript out of range",
-                    "Undimensioned array",
-                    "NEXT without FOR",
-                    "RETURN without GOSUB",
-                    "Undefined line number",
-                    "Division by zero",
-                    "Overflow",
-                    "Type mismatch",
-                    "Redimensioned array",
-                    "Out of data"          // ⟵ ajouté
+                    "Syntax error","Duplicate parameter name","Incorrect number of arguments",
+                    "Illegal function call","Subscript out of range","Undimensioned array",
+                    "NEXT without FOR","RETURN without GOSUB","Undefined line number",
+                    "Division by zero","Overflow","Type mismatch","Redimensioned array","Out of data"
                 ]
                 let trimmedResult = result.trimmingCharacters(in: .whitespacesAndNewlines)
                 if fatalErrors.contains(trimmedResult) {
@@ -492,39 +577,51 @@ class BasicInterpreter: ObservableObject  {
                     output += "\(trimmedResult) in \(lineNumber)\n"
                     output += "Ok\n"
                     resumeIndex = nil
+                    pendingInline = nil
+                    pendingInlineDepth = nil
                     return output
                 }
 
-                // FOR en RUN : mémoriser la ligne et sidx+1 pour NEXT
+                // FOR en RUN : mémoriser pour NEXT
                 if stmtUpper.hasPrefix("FOR "), let lastIdx = forStack.indices.last {
                     if forStack[lastIdx].returnIndex == -1 { forStack[lastIdx].returnIndex = index }
                     if forStack[lastIdx].resumeSidx == nil { forStack[lastIdx].resumeSidx = sidx + 1 }
                 }
 
-                // Contrôles de flux spéciaux
+                // GOTO / GOSUB directs
                 if result == "__GOTO__" || result == "__GOSUB__" {
                     if let target = gotoTarget, let newIndex = keys.firstIndex(of: target) {
+
+                        // ⬇️ PUSH TOUJOURS si c’est un GOSUB, même si la ligne n’est pas "GOSUB ..."
                         if result == "__GOSUB__" {
                             gosubStack.append(GosubFrame(lineIndex: index, nextStmtIndex: sidx + 1))
+                            dumpGosubStack("PUSH @\(lineNumber)")
+
+                            // Si on vient d'un IF avec suite inline, fixer la profondeur de drainage
+                            if pendingInline != nil && pendingInlineDepth == nil {
+                                pendingInlineDepth = gosubStack.count   // profondeur APRÈS push
+                            }
                         }
+
                         gotoTarget = nil
                         resumeIndex = nil
                         index = newIndex
                         continue outer
                     } else {
-                        // cible inexistante -> format MSX
                         if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
-                        output += "Undefined line number in \(lineNumber)\n"
-                        output += "Ok\n"
+                        output += "Undefined line number in \(lineNumber)\nOk\n"
                         resumeIndex = nil
+                        pendingInline = nil
+                        pendingInlineDepth = nil
                         return output
                     }
                 }
 
+
+
                 switch result {
                 case "__WAIT_INPUT__":
                     lastRunOutput = output
-                    // 🟢 Reprendre sur la même ligne, juste après l’INPUT
                     resumeIndex = index
                     resumeStatementIndex = sidx + 1
                     let prompt = pendingPrompt ?? "?"
@@ -533,28 +630,269 @@ class BasicInterpreter: ObservableObject  {
 
                 case "__END__":
                     resumeIndex = nil
+                    pendingInline = nil
+                    pendingInlineDepth = nil   // <-- ajouter
                     if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
                     output += "Ok\n"
                     return output
 
                 case "__RESUME__":
+                    
+                    // Fallback : si rien n’a préparé la reprise, reprendre sur le statement suivant
+                        if resumeIndex == nil && resumeStatementIndex == nil {
+                            resumeIndex = index
+                            resumeStatementIndex = sidx + 1
+                        }
+                    
+                    // 1) Hop back to the caller immediately
                     if let ri = resumeIndex {
+                        let rs = resumeStatementIndex ?? 0
                         index = ri
+                        forcedStatementIndex = rs
                         resumeIndex = nil
-                        continue outer
+                        resumeStatementIndex = nil
                     }
 
+                    // 1.b) NEW — collapse chains of immediate RETURNs (e.g., you just
+                    // returned from 300 into 200, and the very next statement is RETURN)
+                    while index < keys.count {
+                        let lineNumber2 = keys[index]
+                        guard let content2 = program.lines[lineNumber2] else { break }
+                        let u2 = content2.trimmingCharacters(in: .whitespaces).uppercased()
+
+                        // If this is an IF/REM mono-line, we won't split. Otherwise split.
+                        let isMonoNoSplit2 = u2.hasPrefix("IF ") || u2.hasPrefix("REM")
+                        let statements2: [String] = {
+                            if isMonoNoSplit2 { return [content2.trimmingCharacters(in: .whitespaces)] }
+                            else { return splitStatements(content2.trimmingCharacters(in: .whitespaces)) }
+                        }()
+
+                        let nextSIdx = (forcedStatementIndex ?? 0)
+                        if nextSIdx >= statements2.count { break }
+
+                        // If the *next* statement is just RETURN, pop another frame now.
+                        let nextStmt = statements2[nextSIdx].trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                        if nextStmt == "RETURN" {
+                            if let frame2 = gosubStack.popLast() {
+                                // Move to that caller immediately
+                                index = frame2.lineIndex
+                                forcedStatementIndex = frame2.nextStmtIndex
+                                continue   // loop again: we might have another immediate RETURN
+                            } else {
+                                // RETURN without GOSUB: MSX ignores; just skip it
+                                forcedStatementIndex = nextSIdx + 1
+                                break
+                            }
+                        } else {
+                            break // next statement is not a bare RETURN — stop collapsing
+                        }
+                    }
+
+                    // 2) Drain IF inline suite if we've come back to/above the target depth
+                    if let inline = pendingInline, !inline.isEmpty {
+                        if let need = pendingInlineDepth, gosubStack.count > need {
+                            // still inside the subroutine triggered by the IF — drain later
+                        } else {
+                            elog("[runProgram] Drain pendingInline = \(inline)")
+                            pendingInline = nil
+                            pendingInlineDepth = nil
+
+                            var accInline = ""
+                            for s in inline {
+                                let r2 = interpretImmediate(s, isInRun: true)
+                                let r2Trim = r2.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                                if fatalErrors.contains(r2Trim) {
+                                    if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
+                                    output += "\(r2Trim) in \(lineNumber)\nOk\n"
+                                    resumeIndex = nil
+                                    return output
+                                }
+                                if r2Trim == "__WAIT_INPUT__" {
+                                    lastRunOutput = output + accInline
+                                    let prompt = pendingPrompt ?? "?"
+                                    pendingPrompt = nil
+                                    return (output + accInline) + prompt
+                                }
+                                if r2Trim == "__END__" {
+                                    resumeIndex = nil
+                                    if !(output + accInline).hasSuffix("\n") { output += "\n" }
+                                    output = output + accInline + "Ok\n"
+                                    return output
+                                }
+                                if r2Trim == "__GOTO__" || r2Trim == "__GOSUB__" {
+                                    if let target = gotoTarget, let newIndex = keys.firstIndex(of: target) {
+                                        if r2Trim == "__GOSUB__" {
+                                            gosubStack.append(GosubFrame(
+                                                lineIndex: index,
+                                                nextStmtIndex: (forcedStatementIndex ?? 0) + 1
+                                            ))
+                                        }
+                                        gotoTarget = nil
+                                        resumeIndex = nil
+                                        output += accInline
+                                        index = newIndex
+                                        continue outer
+                                    } else {
+                                        if !(output + accInline).hasSuffix("\n") { output += "\n" }
+                                        output = output + accInline + "Undefined line number in \(lineNumber)\nOk\n"
+                                        resumeIndex = nil
+                                        return output
+                                    }
+                                }
+                                if !r2.isEmpty { accInline += r2 }
+                            }
+                            output += accInline
+                        }
+                    }
+
+                    // 3) We’ve set index/forcedStatementIndex correctly — run that line now
+                    continue outer
+
+
+                    //if let ri = resumeIndex {
+                       // index = ri
+                      //  resumeIndex = nil
+                      //  continue outer
+                    //}
+
                 case CLS_MARKER:
-                    output += CLS_MARKER  // la vue se charge de nettoyer l’écran
+                    output += CLS_MARKER
 
                 default:
-                    if !result.isEmpty {
-                        output += result   // PRINT décide déjà des \n
-                        if deferredEnd {
-                            deferredEnd = false
+                    if !result.isEmpty { output += result } // PRINT gère \n
+
+                    // contrôle différé éventuel
+                    if let tok = deferredControl {
+                        deferredControl = nil
+
+                        if tok == "__GOTO__" || tok == "__GOSUB__" {
+                            if let target = gotoTarget, let newIndex = keys.firstIndex(of: target) {
+
+                                if tok == "__GOSUB__" {
+                                    gosubStack.append(GosubFrame(lineIndex: index, nextStmtIndex: sidx + 1))
+                                    elog("[GOSUB(deferred)] push caller index=\(index) nextStmt=\(sidx + 1) (from line \(lineNumber))")
+
+                                    if pendingInline != nil && pendingInlineDepth == nil {
+                                        pendingInlineDepth = gosubStack.count
+                                    }
+                                }
+
+                                gotoTarget = nil
+                                resumeIndex = nil
+                                index = newIndex
+                                continue outer
+                            } else {
+                                if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
+                                output += "Undefined line number in \(lineNumber)\nOk\n"
+                                resumeIndex = nil
+                                pendingInline = nil
+                                pendingInlineDepth = nil
+                                return output
+                            }
+                        }
+
+
+                        switch tok {
+                        case "__WAIT_INPUT__":
+                            lastRunOutput = output
+                            resumeIndex = index
+                            resumeStatementIndex = sidx + 1
+                            let prompt = pendingPrompt ?? "?"
+                            pendingPrompt = nil
+                            return output + prompt
+                        case "__END__":
+                            resumeIndex = nil
                             if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
                             output += "Ok\n"
                             return output
+                        case "__RESUME__":
+                            // Fallback : si rien n’a préparé la reprise, reprendre sur le statement suivant
+                                if resumeIndex == nil && resumeStatementIndex == nil {
+                                    resumeIndex = index
+                                    resumeStatementIndex = sidx + 1
+                                }
+                            
+                            // 1) Revenir D’ABORD sur la ligne appelante + préparer le sidx de reprise
+                            if let ri = resumeIndex {
+                                let rs = resumeStatementIndex ?? 0
+                                index = ri
+                                forcedStatementIndex = rs        // sera appliqué en haut de boucle
+                                resumeIndex = nil
+                                resumeStatementIndex = nil
+                            }
+
+                            // 2) Draine une éventuelle suite inline (IF THEN ... : <suite>)
+                            //    Désormais on est au bon endroit (ligne appelante), donc sidx calculé plus tard
+                            //    via forcedStatementIndex correspondra bien au "prochain statement".
+                            if let inline = pendingInline, !inline.isEmpty {
+                                if let need = pendingInlineDepth, gosubStack.count > need {
+                                    // On est encore dans le GOSUB déclenché par l’IF — ne pas drainer maintenant.
+                                    // On reprendra au retour du (des) GOSUB encore actifs.
+                                } else {
+                                    elog("[runProgram] Drain pendingInline = \(inline)")
+                                    pendingInline = nil
+                                    pendingInlineDepth = nil
+
+                                    var accInline = ""
+                                    for s in inline {
+                                        let r2 = interpretImmediate(s, isInRun: true)
+                                        let r2Trim = r2.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                                        if fatalErrors.contains(r2Trim) {
+                                            if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
+                                            output += "\(r2Trim) in \(lineNumber)\nOk\n"
+                                            resumeIndex = nil
+                                            return output
+                                        }
+                                        if r2Trim == "__WAIT_INPUT__" {
+                                            lastRunOutput = output + accInline
+                                            // On reprendra sur la MÊME ligne appelante, au statement suivant
+                                            resumeIndex = index
+                                            // forcedStatementIndex vient d’être posé au-dessus ; on reprend au suivant
+                                            // donc ici on cible "prochain statement"
+                                            // (le haut de boucle recalcule statements et appliquera forcedStatementIndex)
+                                            let prompt = pendingPrompt ?? "?"
+                                            pendingPrompt = nil
+                                            return (output + accInline) + prompt
+                                        }
+                                        if r2Trim == "__END__" {
+                                            resumeIndex = nil
+                                            if !(output + accInline).hasSuffix("\n") { output += "\n" }
+                                            output = output + accInline + "Ok\n"
+                                            return output
+                                        }
+                                        if r2Trim == "__GOTO__" || r2Trim == "__GOSUB__" {
+                                            if let target = gotoTarget, let newIndex = keys.firstIndex(of: target) {
+                                                if r2Trim == "__GOSUB__" {
+                                                    // on revient après la suite inline
+                                                    gosubStack.append(GosubFrame(lineIndex: index, nextStmtIndex: (forcedStatementIndex ?? 0) + 1))
+                                                }
+                                                gotoTarget = nil
+                                                resumeIndex = nil
+                                                output += accInline
+                                                index = newIndex
+                                                continue outer
+                                            } else {
+                                                if !(output + accInline).hasSuffix("\n") { output += "\n" }
+                                                output = output + accInline + "Undefined line number in \(lineNumber)\nOk\n"
+                                                resumeIndex = nil
+                                                return output
+                                            }
+                                        }
+                                        if !r2.isEmpty { accInline += r2 }
+                                    }
+                                    output += accInline
+                                }
+                            }
+
+                            // 3) On a repositionné index (et posé forcedStatementIndex).
+                            //    Repartir en haut de boucle pour reconstruire `statements` de la ligne appelante.
+                            continue outer
+
+                            
+                        default:
+                            break
                         }
                     }
                 }
@@ -565,12 +903,17 @@ class BasicInterpreter: ObservableObject  {
             index += 1
         }
 
-        // Fin normale de RUN
+        // Fin normale
         resumeIndex = nil
+        pendingInline = nil
+        pendingInlineDepth = nil
         if !output.isEmpty && !output.hasSuffix("\n") { output += "\n" }
         output += "Ok\n"
         return output
     }
+
+
+
 
     // MARK: - Interprétation d'une ligne (stmt unique OU suite ':' traitée en amont)
     private func interpretImmediate(_ command: String, isInRun: Bool) -> String {
@@ -627,19 +970,24 @@ class BasicInterpreter: ObservableObject  {
                 
                 // Si END survient alors qu'on a déjà du texte accumulé,
                 // on renvoie d'abord ce texte, et on signalera END au niveau supérieur.
-                if r == "__END__" {
+                let controlTokens: Set<String> = ["__WAIT_INPUT__", "__GOTO__", "__GOSUB__", "__RESUME__", "__END__"]
+                
+                if controlTokens.contains(r) {
                     if !acc.isEmpty {
-                        deferredEnd = true
-                        return acc          // on renvoie d'abord le texte accumulé
+                        // On renvoie D’ABORD la sortie déjà produite,
+                        // puis on appliquera le contrôle au niveau supérieur (runProgram)
+                        deferredControl = r
+                        return acc
                     }
                     return r
                 }
 
 
+
                 // Les autres contrôles gardent l'ancien comportement
-                if r == "__WAIT_INPUT__" || r == "__GOTO__" || r == "__GOSUB__" || r == "__RESUME__" {
-                    return r
-                }
+                //if r == "__WAIT_INPUT__" || r == "__GOTO__" || r == "__GOSUB__" || r == "__RESUME__" {
+                   // return r
+                //}
 
                 if r == "__NEXT_IMMEDIATE__" {
                     if let resume = forStack.last?.resumeSidx {
@@ -726,11 +1074,17 @@ class BasicInterpreter: ObservableObject  {
             } else {
                 return "Syntax error"
             }
+            
         case "RETURN":
-            guard let frame = gosubStack.popLast() else { return "RETURN without GOSUB" }
-            resumeIndex = frame.lineIndex
-            resumeStatementIndex = frame.nextStmtIndex
-            return "__RESUME__"
+            if let frame = gosubStack.popLast() {
+                resumeIndex = frame.lineIndex
+                resumeStatementIndex = frame.nextStmtIndex
+                return "__RESUME__"
+            } else {
+                // MSX : RETURN hors contexte → ignoré silencieusement
+                return ""
+            }
+
 
         case "CLEAR":
             clearAllUserState(isInRun ? "RUN" : "immédiat")
@@ -1029,6 +1383,7 @@ class BasicInterpreter: ObservableObject  {
 
                 let arrName = String(t[nameR]).uppercased()
                 let inside  = String(t[idxR])
+                consumeRedimAllowanceIfNeeded(arrName)
                 guard let idxs = parseIndicesList(inside) else { elog("[READ] Index list invalide '\(inside)'"); return "Syntax error" }
                 guard let dims = stringArrayDims[arrName], var arr = stringArrays[arrName] else { elog("[READ] '\(arrName)' non dimensionné"); return "Undimensioned array" }
                 guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { elog("[READ] OOB \(arrName)\(idxs)"); return "Subscript out of range" }
@@ -1046,6 +1401,7 @@ class BasicInterpreter: ObservableObject  {
 
                 let arrName = String(t[nameR]).uppercased()
                 let inside  = String(t[idxR])
+                consumeRedimAllowanceIfNeeded(arrName)
                 guard let idxs = parseIndicesList(inside) else { elog("[READ] Index list invalide '\(inside)'"); return "Syntax error" }
                 guard let dims = arrayDims[arrName], var arr = arrays[arrName] else { elog("[READ] '\(arrName)' non dimensionné"); return "Undimensioned array" }
                 guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { elog("[READ] OOB \(arrName)\(idxs)"); return "Subscript out of range" }
@@ -1089,71 +1445,80 @@ class BasicInterpreter: ObservableObject  {
 
     // MARK: - DIM
     private func handleDim(_ line: String) -> String {
-        elog("[DIM] Ligne reçue : '\(line)'")
-        guard let r = line.uppercased().range(of: "DIM") else { return "Syntax error" }
-        let after = line[r.upperBound...].trimmingCharacters(in: .whitespaces)
+            elog("[DIM] Ligne reçue : '\(line)'")
+            guard let r = line.uppercased().range(of: "DIM") else { return "Syntax error" }
+            let after = line[r.upperBound...].trimmingCharacters(in: .whitespaces)
 
-        // Split top-level par virgules
-        var decls: [String] = []
-        var cur = "", inStr = false, paren = 0
-        for ch in after {
-            if ch == "\"" { inStr.toggle(); cur.append(ch); continue }
-            if !inStr {
-                if ch == "(" { paren += 1; cur.append(ch); continue }
-                if ch == ")" { paren = max(0, paren - 1); cur.append(ch); continue }
-                if paren == 0 && ch == "," {
-                    let t = cur.trimmingCharacters(in: .whitespaces)
-                    if !t.isEmpty { decls.append(t) }
-                    cur.removeAll(keepingCapacity: true)
-                    continue
+            // Split top-level par virgules
+            var decls: [String] = []
+            var cur = "", inStr = false, paren = 0
+            for ch in after {
+                if ch == "\"" { inStr.toggle(); cur.append(ch); continue }
+                if !inStr {
+                    if ch == "(" { paren += 1; cur.append(ch); continue }
+                    if ch == ")" { paren = max(0, paren - 1); cur.append(ch); continue }
+                    if paren == 0 && ch == "," {
+                        let t = cur.trimmingCharacters(in: .whitespaces)
+                        if !t.isEmpty { decls.append(t) }
+                        cur.removeAll(keepingCapacity: true)
+                        continue
+                    }
+                }
+                cur.append(ch)
+            }
+            let tail = cur.trimmingCharacters(in: .whitespaces)
+            if !tail.isEmpty { decls.append(tail) }
+            if decls.isEmpty { return "Syntax error" }
+
+            for d in decls {
+                guard let open = d.firstIndex(of: "("),
+                      let close = d.lastIndex(of: ")"),
+                      open < close else {
+                    elog("[DIM] Syntax error sur '\(d)'"); return "Syntax error"
+                }
+
+                let name   = String(d[..<open]).trimmingCharacters(in: .whitespaces).uppercased()
+                let inside = String(d[d.index(after: open)..<close])
+                
+                // ✅ REJET des noms basés sur mot-clé
+                let baseName = name.hasSuffix("$") ? String(name.dropLast()) : name
+                if isReservedKeyword(baseName) {
+                    elog("[DIM] Nom basé sur mot-clé: '\(name)'")
+                    return "Syntax error"
+                }
+
+
+                guard let dims = parseIndicesList(inside), !dims.isEmpty else {
+                    elog("[DIM] Dimensions invalides pour '\(name)'"); return "Syntax error"
+                }
+                let total = dims.map { $0 + 1 }.reduce(1, *)
+
+                // ⬇️ Consommer l’autorisation éventuelle de re-DIM (si le nom existait avant CLEAR)
+                let hadAllowance = redimAllowedAfterClear.remove(name) != nil
+
+                if name.hasSuffix("$") {
+                    // String array
+                    if let _ = stringArrayDims[name] {
+                        // tableau déjà (re)défini après CLEAR
+                        if !hadAllowance { return "Redimensioned array" }
+                    }
+                    stringArrayDims[name] = dims
+                    stringArrays[name]    = Array(repeating: "", count: total)
+                    elog("[DIM] String array '\(name)' dims=\(dims) total=\(total) allowance=\(hadAllowance)")
+                } else {
+                    // Numeric array
+                    if let _ = arrayDims[name] {
+                        if !hadAllowance { return "Redimensioned array" }
+                    }
+                    arrayDims[name] = dims
+                    arrays[name]    = Array(repeating: 0.0, count: total)
+                    elog("[DIM] Numeric array '\(name)' dims=\(dims) total=\(total) allowance=\(hadAllowance)")
                 }
             }
-            cur.append(ch)
+
+            return ""
         }
-        let tail = cur.trimmingCharacters(in: .whitespaces)
-        if !tail.isEmpty { decls.append(tail) }
-        if decls.isEmpty { return "Syntax error" }
 
-        for d in decls {
-            guard let open = d.firstIndex(of: "("),
-                  let close = d.lastIndex(of: ")"),
-                  open < close else {
-                elog("[DIM] Syntax error sur '\(d)'"); return "Syntax error"
-            }
-
-            let name   = String(d[..<open]).trimmingCharacters(in: .whitespaces).uppercased()
-            let inside = String(d[d.index(after: open)..<close])
-
-            guard let dims = parseIndicesList(inside), !dims.isEmpty else {
-                elog("[DIM] Dimensions invalides pour '\(name)'"); return "Syntax error"
-            }
-            let total = dims.map { $0 + 1 }.reduce(1, *)
-
-            // ⬇️ Consommer l’autorisation éventuelle de re-DIM (si le nom existait avant CLEAR)
-            let hadAllowance = redimAllowedAfterClear.remove(name) != nil
-
-            if name.hasSuffix("$") {
-                // String array
-                if let _ = stringArrayDims[name] {
-                    // tableau déjà (re)défini après CLEAR
-                    if !hadAllowance { return "Redimensioned array" }
-                }
-                stringArrayDims[name] = dims
-                stringArrays[name]    = Array(repeating: "", count: total)
-                elog("[DIM] String array '\(name)' dims=\(dims) total=\(total) allowance=\(hadAllowance)")
-            } else {
-                // Numeric array
-                if let _ = arrayDims[name] {
-                    if !hadAllowance { return "Redimensioned array" }
-                }
-                arrayDims[name] = dims
-                arrays[name]    = Array(repeating: 0.0, count: total)
-                elog("[DIM] Numeric array '\(name)' dims=\(dims) total=\(total) allowance=\(hadAllowance)")
-            }
-        }
-
-        return ""
-    }
 
 
            
@@ -1195,81 +1560,49 @@ class BasicInterpreter: ObservableObject  {
             if trimmed.isEmpty { return nil } // segment vide -> rien à afficher
             lastSep = nil
 
-            // 1) Littéral chaîne BASIC
-            if let decoded = decodeBasicStringLiteral(trimmed) {
-                // Espace si chaîne suit un nombre avec ';'
-                if prevWasNumeric && lastSep != "," && col > 0 { appendText(" ") }
-                appendText(decoded)
-                prevWasNumeric = false
-                elog("[PRINT] Chaîne directe : '\(decoded)'")
-                return nil
-            }
-
-            // 2) Variable numérique
-            if let value = variables[trimmed.uppercased()] {
-                // Nombre → pas d’espace ici, mais on pose le flag
-                let formatted = formatNumber(value)
-                // Si tu as formatNumberForPrint(d), utilise-le:
-                appendText(formatNumberForPrint(value))
-                prevWasNumeric = true
-                elog("[PRINT] Var num \(trimmed.uppercased()) = \(formatted)")
-                return nil
-            }
-
-            // 3) Variable texte
-            if trimmed.uppercased().hasSuffix("$") {
-                let text = varText[trimmed.uppercased()] ?? ""
-                // Espace si chaîne suit un nombre avec ';'
-                if prevWasNumeric && lastSep != "," && col > 0 { appendText(" ") }
-                appendText(text)
-                prevWasNumeric = false
-                elog("[PRINT] Var texte \(trimmed.uppercased()) = '\(text)'")
-                return nil
-            }
-
-            // 4) Expression générale
+            // ✅ Toujours évaluer l'expression (TIME$, TIME, A$, "abc"+TIME$, 2+3, etc.)
             let result = evaluateExpression(trimmed)
 
-            // ⛔️ Mapper le sentinelle interne vers le message MSX
+            // Mapper le sentinelle interne vers le message MSX
             if result == "__UNDIMENSIONED__" { return "Undimensioned array" }
 
-            // ⛔️ Propagation directe des erreurs fatales
+            // Propager erreurs fatales
             let fatalErrors: Set<String> = [
                 "Syntax error",
                 "Incorrect number of arguments",
                 "Illegal function call",
                 "Subscript out of range",
                 "Undimensioned array",
+                "Division by zero",
+                "Overflow",
+                "Type mismatch"
             ]
             if fatalErrors.contains(result) {
                 elog("[PRINT] Erreur fatale renvoyée par eval: \(result)")
                 return result
             }
 
-            if result.hasPrefix("\""), result.hasSuffix("\""), result.count >= 2 {
-                // résultat chaîne (quoted)
-                let cleaned = String(result.dropFirst().dropLast())
-                // Espace si chaîne suit un nombre avec ';'
-                if prevWasNumeric && lastSep != "," && col > 0 { appendText(" ") }
-                appendText(cleaned)
-                prevWasNumeric = false
-                elog("[PRINT] Résultat chaîne : '\(cleaned)'")
-            } else if let d = Double(result.trimmingCharacters(in: .whitespaces)) {
-                // résultat numérique
-                let formatted = formatNumber(d)
-                // Si tu as formatNumberForPrint(d), garde-le :
+            // Essayer interprétation numérique
+            let asNum = result.replacingOccurrences(of: ",", with: ".")
+            if let d = Double(asNum) {
+                // Impression numérique (ton formateur habituel)
                 appendText(formatNumberForPrint(d))
                 prevWasNumeric = true
-                elog("[PRINT] Résultat numérique formaté : '\(formatted)'")
-            } else {
-                // résultat non-quoté non numérique -> traiter comme texte
-                if prevWasNumeric && lastSep != "," && col > 0 { appendText(" ") }
-                appendText(result)
-                prevWasNumeric = false
-                elog("[PRINT] Résultat : '\(result)'")
+                elog("[PRINT] Résultat numérique formaté : '\(formatNumber(d))'")
+                return nil
             }
+
+            // Sinon, considérer comme chaîne (evaluateExpression rend déjà sans guillemets)
+            if prevWasNumeric && lastSep != "," && col > 0 {
+                // espace entre un nombre et une chaîne si séparateur ';'
+                appendText(" ")
+            }
+            appendText(result)
+            prevWasNumeric = false
+            elog("[PRINT] Résultat chaîne : '\(result)'")
             return nil
         }
+
 
 
         // Scan pour gérer , et ; hors guillemets ET hors parenthèses
@@ -1389,10 +1722,14 @@ class BasicInterpreter: ObservableObject  {
     }
 
     private func handleIf(_ trimmed: String, isInRun: Bool) -> String {
+        // --- Forme: IF <cond> THEN <...> [ELSE <...>] ---
         if let thenIdx = findKeywordTopLevel(trimmed, keyword: "THEN") {
-            let condPart = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 2)..<thenIdx]).trimmingCharacters(in: .whitespaces)
+            let condPart = String(trimmed[trimmed.index(trimmed.startIndex, offsetBy: 2)..<thenIdx])
+                .trimmingCharacters(in: .whitespaces)
+
             let thenEnd = trimmed.index(thenIdx, offsetBy: 4)
             let afterThen = String(trimmed[thenEnd...]).trimmingCharacters(in: .whitespaces)
+
             var thenCmd = afterThen
             var elseCmd: String? = nil
             if let elseIdx = findKeywordTopLevel(afterThen, keyword: "ELSE") {
@@ -1400,6 +1737,7 @@ class BasicInterpreter: ObservableObject  {
                 thenCmd = String(afterThen[..<elseIdx]).trimmingCharacters(in: .whitespaces)
                 elseCmd = String(afterThen[elseEnd...]).trimmingCharacters(in: .whitespaces)
             }
+
             elog("[IF] Condition = '\(condPart)'")
             elog("[IF] THEN part = '\(thenCmd)'")
             elog("[IF] ELSE part = '\(elseCmd ?? "(none)")'")
@@ -1409,20 +1747,84 @@ class BasicInterpreter: ObservableObject  {
             if condEval == "Syntax error" { return "Syntax error" }
 
             let isTrue = (Double(condEval.replacingOccurrences(of: ",", with: ".")) ?? 0) != 0
-
             let branch = isTrue ? thenCmd : (elseCmd ?? "")
             if branch.isEmpty { return "" }
 
+            // Cas spécial MSX : branche = nombre nu -> GOTO direct
             let firstStmt = splitStatements(branch).first ?? branch
             if let ln = Int(firstStmt.trimmingCharacters(in: .whitespaces)) {
                 elog("[IF] THEN/ELSE commence par un nombre nu → GOTO \(ln)")
                 gotoTarget = ln
                 return "__GOTO__"
             }
-            return interpretImmediate(branch, isInRun: isInRun)
+
+            // Exécuter séquentiellement les sous-instructions de la branche
+            let stmts = splitStatements(branch)
+            var acc = ""
+
+            // Contrôles spéciaux à gérer
+            let controlTokens: Set<String> = ["__WAIT_INPUT__", "__GOTO__", "__GOSUB__", "__RESUME__", "__END__"]
+            let fatalErrors: Set<String> = [
+                "Syntax error","Incorrect number of arguments","Illegal function call",
+                "Subscript out of range","Undimensioned array","NEXT without FOR",
+                "RETURN without GOSUB","Undefined line number","Division by zero",
+                "Overflow","Type mismatch","Redimensioned array","Out of data"
+            ]
+
+            for (idx, s) in stmts.enumerated() {
+                let r = interpretImmediate(s, isInRun: isInRun)
+                let rTrim = r.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if controlTokens.contains(rTrim) || fatalErrors.contains(rTrim) {
+
+                    if controlTokens.contains(rTrim) {
+                        let rest = Array(stmts.dropFirst(idx + 1))
+
+                        switch rTrim {
+                        case "__GOSUB__":
+                            // On reprendra la "suite inline" APRÈS le retour du GOSUB
+                            pendingInline = rest.isEmpty ? nil : rest
+                            pendingInlineDepth = gosubStack.count + 1   // cible = profondeur après le PUSH à venir
+
+                        case "__WAIT_INPUT__":
+                            // On reprendra au même statement après l’INPUT
+                            pendingInline = rest.isEmpty ? nil : rest
+                            pendingInlineDepth = gosubStack.count       // pas de GOSUB, donc profondeur inchangée
+
+                        case "__GOTO__", "__END__":
+                            // On part ailleurs / on termine -> pas de suite inline
+                            pendingInline = nil
+                            pendingInlineDepth = nil
+
+                        case "__RESUME__":
+                            // On est en train de remonter d’un RETURN.
+                            // Ne PAS créer une nouvelle suite ici : runProgram drainera
+                            // ce qui était déjà en attente (si c’était un IF…THEN…GOSUB…:suite).
+                            // Donc on ne touche pas pendingInline / pendingInlineDepth.
+                            break
+
+                        default:
+                            break
+                        }
+                    }
+
+                    // Si on avait déjà imprimé quelque chose, on le renvoie d’abord,
+                    // et runProgram appliquera le contrôle via deferredControl.
+                    if controlTokens.contains(rTrim) && !acc.isEmpty {
+                        deferredControl = rTrim
+                        return acc
+                    }
+                    return rTrim
+                }
+
+
+                if !r.isEmpty { acc += r }
+            }
+            return acc
+
         }
 
-        // --- forme: IF <cond> GOTO <line> (sans THEN) ---
+        // --- Forme: IF <cond> GOTO <line> (sans THEN) ---
         let afterIF = trimmed.dropFirst(2).trimmingCharacters(in: .whitespaces)
         guard let gotoIdx = findKeywordTopLevel(String(afterIF), keyword: "GOTO") else {
             elog("[IF] Ni THEN ni GOTO -> Syntax error")
@@ -1437,9 +1839,7 @@ class BasicInterpreter: ObservableObject  {
         elog("[IF] evaluateExpression(cond) = '\(condEval)'")
         if condEval == "Syntax error" { return "Syntax error" }
 
-        // ✅ MSX : toute valeur non nulle est vraie
         let truthy = (Double(condEval.replacingOccurrences(of: ",", with: ".")) ?? 0) != 0
-
         if truthy {
             if let ln = Int(linePart) {
                 elog("[IF] Condition vraie -> GOTO \(ln)")
@@ -1453,8 +1853,11 @@ class BasicInterpreter: ObservableObject  {
             elog("[IF] Condition fausse -> pas d'action")
             return ""
         }
-
     }
+
+
+
+
 
     private func handleGoto(_ tokens: [String]) -> String {
         if tokens.count >= 2, let target = Int(tokens[1]) {
@@ -1495,18 +1898,71 @@ class BasicInterpreter: ObservableObject  {
 
         let lhsU = lhs.uppercased()
 
-        // --- Variable système TIME ---
+        // --- 0) CAS SPÉCIAUX SYSTÈME AVANT TOUT ---
+        // TIME (numérique)
         if lhsU == "TIME" {
             let valueStr = evaluateExpression(String(rhs))
             if valueStr == "__UNDIMENSIONED__" { return "Undimensioned array" }
             if valueStr == "Subscript out of range" { return valueStr }
             if valueStr == "Syntax error" { return "Syntax error" }
             let valueNorm = valueStr.replacingOccurrences(of: ",", with: ".")
-            guard let value = Double(valueNorm) else { return "Syntax error" }
-            writeTIME(Int(value))
-            elog("[assign] TIME <- \(Int(value))")
+            guard let v = Double(valueNorm) else { return "Syntax error" }
+            // MSX: secondes 0..86399 (tu peux modulo si tu veux tolérer)
+            writeTIME(Int(v))
+            elog("[assign] TIME <- \(Int(v))")
             return ""
         }
+
+        // TIME$ (chaîne "HH:MM:SS")
+        if lhsU == "TIME$" {
+            // RHS doit être une expression CHAÎNE
+            if !looksStringExpr(String(rhs)) { return "Type mismatch" }
+
+            let evaluated = evaluateExpression(String(rhs))
+            if evaluated == "__UNDIMENSIONED__" { return "Undimensioned array" }
+            if evaluated == "Subscript out of range" { return evaluated }
+            if evaluated == "Syntax error" { return "Syntax error" }
+
+            // Récupère le texte (avec ou sans guillemets)
+            let s: String = {
+                if evaluated.hasPrefix("\""), evaluated.hasSuffix("\""), evaluated.count >= 2 {
+                    return String(evaluated.dropFirst().dropLast())
+                } else {
+                    return evaluated
+                }
+            }()
+
+            // Parse HH:MM:SS
+            let parts = s.split(separator: ":").map { String($0) }
+            guard parts.count == 3,
+                  let hh = Int(parts[0]), let mm = Int(parts[1]), let ss = Int(parts[2]),
+                  (0...23).contains(hh), (0...59).contains(mm), (0...59).contains(ss) else {
+                return "Illegal function call"
+            }
+
+            let secs = hh * 3600 + mm * 60 + ss
+            writeTIME(secs)
+            elog("[assign] TIME$ <- \(s) (\(secs)s)")
+            return ""
+        }
+
+        // --- 1) (APRÈS TIME/TIME$) REJET des noms basés sur mot-clé ---
+        let baseForKeywordCheck: String = {
+            if let p = lhsU.firstIndex(of: "(") { return String(lhsU[..<p]) }
+            return lhsU
+        }()
+        let base = baseForKeywordCheck.hasSuffix("$")
+            ? String(baseForKeywordCheck.dropLast())
+            : baseForKeywordCheck
+        if isReservedKeyword(base) {
+            elog("[assign] LHS basé sur mot-clé: '\(lhs)'")
+            return "Syntax error"
+        }
+
+        // --- Valider LHS ---
+        // (le reste de ta fonction inchangé)
+
+        // === 3) Le reste de ta logique, inchangé ===
 
         // Valider LHS
         let isVar    = lhsU.range(of: #"^[A-Z][A-Z0-9]*\$?$"#,     options: .regularExpression) != nil
@@ -1519,7 +1975,7 @@ class BasicInterpreter: ObservableObject  {
 
         elog("[assign] lhs='\(lhs)' rhs='\(rhs)'")
 
-        // --- Tableau chaîne multi-d : NAME$(i[,j...]) = <expr$> (STRICT MSX)
+        // --- Tableau chaîne multi-d
         if let match = try? NSRegularExpression(pattern: #"^([A-Z][A-Z0-9]*\$)\((.+)\)$"#)
             .firstMatch(in: String(lhs), range: NSRange(lhs.startIndex..., in: lhs)),
            let nameRange = Range(match.range(at: 1), in: lhs),
@@ -1527,12 +1983,11 @@ class BasicInterpreter: ObservableObject  {
 
             let varName = String(lhs[nameRange]).uppercased()
             let inside  = String(lhs[insideRange])
-
+            consumeRedimAllowanceIfNeeded(varName)
             guard let idxs = parseIndicesList(inside) else { return "Syntax error" }
             guard let dims = stringArrayDims[varName], var arr = stringArrays[varName] else { return "Undimensioned array" }
             guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { return "Subscript out of range" }
 
-            // STRICT MSX : RHS doit être une expression CHAÎNE (détection syntaxique)
             if !looksStringExpr(String(rhs)) { return "Type mismatch" }
 
             let evaluated = evaluateExpression(String(rhs))
@@ -1540,7 +1995,6 @@ class BasicInterpreter: ObservableObject  {
             if evaluated == "Subscript out of range" { return evaluated }
             if evaluated == "Syntax error" { return "Syntax error" }
 
-            // Nettoyage guillemets si présents, sinon prendre tel quel
             let cleaned: String
             if evaluated.hasPrefix("\""), evaluated.hasSuffix("\""), evaluated.count >= 2 {
                 cleaned = String(evaluated.dropFirst().dropLast())
@@ -1554,9 +2008,8 @@ class BasicInterpreter: ObservableObject  {
             return ""
         }
 
-        // --- Scalaire chaîne : NAME$ = <expr$> (STRICT MSX)
+        // --- Scalaire chaîne
         if lhs.hasSuffix("$") {
-            // STRICT MSX : RHS doit être une expression CHAÎNE (détection syntaxique)
             if !looksStringExpr(String(rhs)) { return "Type mismatch" }
 
             let evaluated = evaluateExpression(String(rhs))
@@ -1579,7 +2032,7 @@ class BasicInterpreter: ObservableObject  {
             return ""
         }
 
-        // --- Tableau numérique multi-d : NAME(i[,j...]) = <expr>
+        // --- Tableau numérique multi-d
         if let match = try? NSRegularExpression(pattern: #"^([A-Z][A-Z0-9]*)\((.+)\)$"#)
             .firstMatch(in: String(lhs), range: NSRange(lhs.startIndex..., in: lhs)),
            let nameRange = Range(match.range(at: 1), in: lhs),
@@ -1587,7 +2040,7 @@ class BasicInterpreter: ObservableObject  {
 
             let varName = String(lhs[nameRange]).uppercased()
             let inside = String(lhs[insideRange])
-
+            consumeRedimAllowanceIfNeeded(varName)
             guard let dims = arrayDims[varName], var arr = arrays[varName] else { elog("[assign] '\(varName)' non dimensionné"); return "Undimensioned array" }
             guard let idxs = parseIndicesList(inside) else { return "Syntax error" }
             guard let off = linearIndex(from: idxs, dims: dims), off < arr.count else { return "Subscript out of range" }
@@ -1605,7 +2058,7 @@ class BasicInterpreter: ObservableObject  {
             return ""
         }
 
-        // --- Scalaire numérique : NAME = <expr>
+        // --- Scalaire numérique
         let valueStr = evaluateExpression(String(rhs))
         if valueStr == "__UNDIMENSIONED__" { return "Undimensioned array" }
         if valueStr == "Subscript out of range" { return valueStr }
@@ -1621,6 +2074,7 @@ class BasicInterpreter: ObservableObject  {
         elog("[assign] Affectation numérique : \(varName) = \(value)")
         return ""
     }
+
 
     private func looksStringExpr(_ raw: String) -> Bool {
         // Uppercase en ignorant ce qui est entre guillemets
@@ -1962,10 +2416,12 @@ class BasicInterpreter: ObservableObject  {
         let K: Set<String> = [
             "PRINT","INPUT","GOTO","GOSUB","RETURN","IF","THEN","ELSE","FOR","NEXT",
             "DIM","DATA","READ","RESTORE","ON","STOP","END","CLEAR","CLOAD","SAVE",
-            "CLS","DEF","TIME","REM","LET","RUN"
+            "CLS","DEF","TIME","REM","LET","RUN","NEW", // ← ajouté NEW
+            // "ERR","ERL" // optionnel si tu veux bloquer ces variables système
         ]
         return K.contains(u)
     }
+
     
     private func substituteMsxNumericFunctions(in expr: String) -> String {
         var s = expr
@@ -2245,9 +2701,42 @@ class BasicInterpreter: ObservableObject  {
         cleanedExpr = implicitConcat2
         elog("[eval] Après concat implicite = '\(cleanedExpr)'")
 
+        // === TIME/TIME$ (fast-path si l'expression ENTIEREMENT est TIME ou TIME$) ===
+        do {
+            // tolère les parenthèses englobantes : (TIME$), ( TIME ), etc.
+            let whole = stripOuterParentheses(cleanedExpr).trimmingCharacters(in: .whitespaces)
+            let upWhole = whole.uppercased()
+            if upWhole == "TIME$" {
+                // retourne la chaîne SANS guillemets (convention de evaluateExpression)
+                return readTimeString()
+            }
+            if upWhole == "TIME" {
+                // retourne le nombre formaté
+                return formatNumber(Double(readTIME()))
+            }
+        }
+        // ============================================================================
 
-
-
+        // === Substitution TIME/TIME$ à l'intérieur d'expressions plus grandes =======
+        // (hors guillemets uniquement)
+        cleanedExpr = withStringLiteralsShielded(cleanedExpr) { body in
+            var t = body
+            // Remplacer TIME$ par un littéral "HH:MM:SS"
+            t = t.replacingOccurrences(
+                of: #"(?<![A-Z0-9\$])TIME\$(?![A-Z0-9\$\(])"#,
+                with: "\"\(readTimeString().replacingOccurrences(of: "\"", with: "\"\""))\"",
+                options: .regularExpression
+            )
+            // Remplacer TIME par sa valeur numérique 0..86399
+            t = t.replacingOccurrences(
+                of: #"(?<![A-Z0-9\$])TIME(?![A-Z0-9\$\(])"#,
+                with: formatNumber(Double(readTIME())),
+                options: .regularExpression
+            )
+            return t
+        }
+        elog("[eval] Après subst TIME/TIME$ = '\(cleanedExpr)'")
+        // ============================================================================
 
 
         // 3) Comparaison chaîne simple A$="HELLO" (égalité simple au niveau top)
@@ -2301,15 +2790,6 @@ class BasicInterpreter: ObservableObject  {
         }
 
 
-        
-        // Remplacer TIME (hors guillemets) par sa valeur courante en ticks
-        cleanedExpr = cleanedExpr.replacingOccurrences(
-            of: #"(?<!\w)TIME(?!\w)"#,
-            with: formatNumber(Double(readTIME())),
-            options: .regularExpression
-        )
-        elog("[eval] cleanedExpr = '\(cleanedExpr)'")
-
         // 6) Substitutions tableaux
         cleanedExpr = substituteNumericArrays(in: cleanedExpr)
         cleanedExpr = substituteStringArrays(in: cleanedExpr)
@@ -2318,43 +2798,59 @@ class BasicInterpreter: ObservableObject  {
             return cleanedExpr
         }
 
-        // 7) Substitution variables
-        for (name, value) in varText.sorted(by: { $0.key.count > $1.key.count }) {
-            let pattern = "(?<!\\w)" + NSRegularExpression.escapedPattern(for: name) + "(?!\\w)"
-            cleanedExpr = cleanedExpr.replacingOccurrences(of: pattern, with: "\"\(value)\"", options: .regularExpression)
-        }
-        for (name, value) in variables {
-            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b"
-            cleanedExpr = cleanedExpr.replacingOccurrences(of: pattern, with: "\(value)", options: .regularExpression)
+        // 7) Substitution variables — NE JAMAIS toucher l'intérieur des "..."
+        cleanedExpr = withStringLiteralsShielded(cleanedExpr) { body in
+            var t = body
+
+            // 7.1) D’ABORD : variables numériques (I, J, ERR, …)
+            for (name, value) in variables.sorted(by: { $0.key.count > $1.key.count }) {
+                let pat = "(?<![A-Z0-9\\$])" + NSRegularExpression.escapedPattern(for: name) + "(?![A-Z0-9\\$\\(])"
+                t = t.replacingOccurrences(of: pat,
+                                           with: formatNumber(value),
+                                           options: .regularExpression)
+            }
+
+            // 7.2) ENSUITE : variables texte (A$, NOM$…) -> "valeur"
+            for (name, value) in varText.sorted(by: { $0.key.count > $1.key.count }) {
+                let pat = "(?<![A-Z0-9\\$])" + NSRegularExpression.escapedPattern(for: name) + "(?![A-Z0-9\\$\\(])"
+                let quoted = "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+                t = t.replacingOccurrences(of: pat,
+                                           with: quoted,
+                                           options: .regularExpression)
+            }
+
+            return t
         }
 
-        // 7.4) Fonctions chaîne → "..."
+
+
+
+        // 7.4) Fonctions chaîne → littéraux "..."
         let subS = substituteStringFunctions(in: cleanedExpr)
-        if subS == "Syntax error" || subS == "Illegal function call" {
-            return subS
-        }
+        if subS == "Syntax error" || subS == "Illegal function call" { return subS }
         cleanedExpr = subS
 
-        // 7.5) Fonctions numériques (VAL/LEN/ASC/INSTR) → littéraux
+        // 7.5) Fonctions numériques de base (VAL/LEN/ASC/INSTR) → nombres
         let sub = substituteNumericFunctions(in: cleanedExpr)
-        if sub == "Syntax error" || sub == "Subscript out of range" || sub == "__UNDIMENSIONED__" {
-            elog("[eval] Erreur pendant substitution fonctions numériques: '\(sub)'")
-            return sub
-        }
+        if sub == "Syntax error" || sub == "Subscript out of range" || sub == "__UNDIMENSIONED__" { return sub }
         cleanedExpr = sub
-        
-        // 7.6) Fonctions numériques MSX anywhere (ABS/SGN/…/RND)
+
+        // 7.6) Fonctions numériques MSX (ABS/SGN/.../RND)
         let sub2 = substituteMsxNumericFunctions(in: cleanedExpr)
-        if sub2 == "Syntax error" || sub2 == "Illegal function call" || sub2 == "Overflow" {
-            return sub2
-        }
+        if sub2 == "Syntax error" || sub2 == "Illegal function call" || sub2 == "Overflow" { return sub2 }
         cleanedExpr = sub2
 
-       
-        // 8) Normalisation opérateurs (= → == ; <> → !=) en respectant les guillemets
-        cleanedExpr = cleanedExpr.replacingOccurrences(of: "<>", with: "!=")
-        cleanedExpr = normalizeEqualsOutsideQuotes(cleanedExpr)
-     
+        // — conversions de bases &H.. / &B.. uniquement hors guillemets —
+        cleanedExpr = withStringLiteralsShielded(cleanedExpr) { src in
+            convertRadixLiteralsOutsideQuotes(src) // ta fonction existante
+        }
+
+        // 8) Normalisation des opérateurs (= → == ; <> → !=) HORS guillemets
+        cleanedExpr = withStringLiteralsShielded(cleanedExpr) { src in
+            var t = src.replacingOccurrences(of: "<>", with: "!=")
+            t = normalizeEqualsOutsideQuotes(t) // ta fonction existante (danger si non protégé)
+            return t
+        }
 
         elog("[eval] Après substitution/normalisation : '\(cleanedExpr)'")
 
@@ -2477,7 +2973,7 @@ class BasicInterpreter: ObservableObject  {
                 }
             }
         }
-        // 10.56) Exponentiation ^ (associativité GAUCHE, plus prioritaire que * / MOD)
+        // 10.55) Exponentiation ^ (associativité GAUCHE, plus prioritaire que * / MOD)
         if let parts = splitTopLevelByCaret(cleanedExpr), parts.count > 1 {
             let MSX_MAX: Double = 1.7014118e38
             func toDouble(_ s: String) -> (ok: Bool, val: Double, err: String?) {
@@ -2624,23 +3120,21 @@ class BasicInterpreter: ObservableObject  {
             return ok ? "-1" : "0"
         }
         
-        //
-        if cleanedExpr.range(of: #"^[A-Z][A-Z0-9]*$"#, options: .regularExpression) != nil {
+        // 14) Identifiants nus (variables), avec rejet des mots-clés réservés
+        if cleanedExpr.range(of: #"^[A-Z][A-Z0-9]*\$?$"#, options: .regularExpression) != nil {
             let U = cleanedExpr.uppercased()
-            if isReservedKeyword(U) { return "Syntax error" } // ⟵ au lieu de retourner 0
-            let v = variables[U] ?? 0
-            return formatNumber(v)
+            let base = U.hasSuffix("$") ? String(U.dropLast()) : U
+            if isReservedKeyword(base) { return "Syntax error" }
+
+            if U.hasSuffix("$") {
+                // variable chaîne
+                return varText[U] ?? ""
+            } else {
+                // variable numérique
+                return formatNumber(variables[U] ?? 0)
+            }
         }
 
-
-        // 14) Identifiants nus
-        if cleanedExpr.range(of: #"^[A-Z][A-Z0-9]*\$$"#, options: .regularExpression) != nil {
-            return varText[cleanedExpr.uppercased()] ?? ""
-        }
-        if cleanedExpr.range(of: #"^[A-Z][A-Z0-9]*$"#, options: .regularExpression) != nil {
-            let v = variables[cleanedExpr.uppercased()] ?? 0
-            return formatNumber(v)
-        }
         // Remplacer les littéraux &H.. / &B.. hors guillemets
         cleanedExpr = convertRadixLiteralsOutsideQuotes(cleanedExpr)
 
@@ -3150,7 +3644,7 @@ class BasicInterpreter: ObservableObject  {
             guard isPureCall(expr),
                   let args = extractArgsTopLevel(expr, expectedMin: 1, expectedMax: 1),
                   let x = Double(evaluateExpression(args[0])) else { return nil }
-            return formatNumber(x)
+            return formatNumberForPrint(x)
         }
         return nil
     }
@@ -3256,7 +3750,7 @@ class BasicInterpreter: ObservableObject  {
             guard let nameR = Range(m.range(at: 1), in: result),
                   let insideR = Range(m.range(at: 2), in: result) else { continue }
             let name = String(result[nameR]).uppercased()
-
+            consumeRedimAllowanceIfNeeded(name)
             // ⛔️ Ne pas traiter comme tableau si nom réservé (fonction/opérateur)
             if reservedNames.contains(name) { continue }
 
@@ -3293,6 +3787,7 @@ class BasicInterpreter: ObservableObject  {
                   let insideR = Range(m.range(at: 2), in: result) else { continue }
             let name = String(result[nameR]).uppercased()
             if fnNames$.contains(name) { continue }
+            consumeRedimAllowanceIfNeeded(name)
             let inside = String(result[insideR])
 
             guard let idxs = parseIndicesList(inside) else { return "Syntax error" }
@@ -3354,18 +3849,19 @@ class BasicInterpreter: ObservableObject  {
         elog("[CLEAR] \(R) — effacement de l'état utilisateur")
         elog("[CLEAR] Avant: num=\(variables.count), arrNum=\(arrays.count), str=\(varText.count), arrStr=\(stringArrays.count), gosub=\(gosubStack.count), for=\(forStack.count)")
 
-        // Autoriser un re-DIM une seule fois seulement pour CLEAR utilisateur
-        let allowRedimOnce = (R == "IMMÉDIAT" || R == "IMMEDIAT" || R == "RUN")
-        if allowRedimOnce {
-            // capture des noms AVANT l'effacement des tableaux
-            let numNames = Set(arrayDims.keys)
-            let strNames = Set(stringArrayDims.keys)
-            redimAllowedAfterClear = numNames.union(strNames)
-        } else {
-            redimAllowedAfterClear.removeAll()
+        // Helper: remet à zéro tout en gardant les dimensions actuelles
+        func zeroAllArraysButKeepDims() {
+            for (name, dims) in arrayDims {
+                let total = dims.map { $0 + 1 }.reduce(1, *)
+                arrays[name] = Array(repeating: 0.0, count: total)
+            }
+            for (name, dims) in stringArrayDims {
+                let total = dims.map { $0 + 1 }.reduce(1, *)
+                stringArrays[name] = Array(repeating: "", count: total)
+            }
         }
 
-        // Scalars & runtime state
+        // État d’exécution (hors DIM)
         variables.removeAll()
         varText.removeAll()
         gosubStack.removeAll()
@@ -3374,37 +3870,71 @@ class BasicInterpreter: ObservableObject  {
         inputVariable = nil
         pendingPrompt = nil
         resumeIndex = nil
-        gotoTarget = nil
-        deferredEnd = false
-        inputCtx = nil
         resumeStatementIndex = nil
         forcedStatementIndex = nil
+        gotoTarget = nil
+        deferredControl = nil
+        pendingInline = nil
+        pendingInlineDepth = nil
+        inputCtx = nil
 
-        // TIME like MSX
-        timeSetMoment = Date()
-        timeSetOffset = 0
-
-        // CLEAR efface toujours les DIM et DEF FN
-        arrays.removeAll()
-        stringArrays.removeAll()
-        arrayDims.removeAll()
-        stringArrayDims.removeAll()
-        userFunctions.removeAll()
-        userStringFunctions.removeAll()
-
-        // DATA seulement sur RUN start / LOAD / NEW
         switch R {
         case "RUN START", "LOAD", "NEW":
+            // 🔁 RESET complet (comme un cold start)
+            arrays.removeAll()
+            stringArrays.removeAll()
+            arrayDims.removeAll()
+            stringArrayDims.removeAll()
+            userFunctions.removeAll()
+            userStringFunctions.removeAll()
+            redimAllowedAfterClear.removeAll()
+
+            // DATA + horloge
+            resetClockFromSystem()
             preloadedDataFromProgram = false
             dataPool.removeAll()
             dataPointer = 0
             elog("[DATA] Reset pool et pointeur (raison \(R))")
+
+        case "RUN":
+            // 🟦 CLEAR en cours de programme (comportement MSX 1.0)
+            // 1) Donner un « joker » de re-DIM par nom existant
+            let numNames = Set(arrayDims.keys)
+            let strNames = Set(stringArrayDims.keys)
+            redimAllowedAfterClear = numNames.union(strNames)
+
+            // 2) Conserver les dimensions et remettre le contenu à zéro
+            zeroAllArraysButKeepDims()
+
+            // (Optionnel) La plupart des MSX effacent aussi les DEF FN au CLEAR
+            userFunctions.removeAll()
+            userStringFunctions.removeAll()
+
+        case "IMMEDIAT", "IMMÉDIAT":
+            // CLEAR en mode direct : reset complet
+            arrays.removeAll()
+            stringArrays.removeAll()
+            arrayDims.removeAll()
+            stringArrayDims.removeAll()
+            userFunctions.removeAll()
+            userStringFunctions.removeAll()
+            redimAllowedAfterClear.removeAll()
+
         default:
-            break
+            // fallback sûr : reset complet
+            arrays.removeAll()
+            stringArrays.removeAll()
+            arrayDims.removeAll()
+            stringArrayDims.removeAll()
+            userFunctions.removeAll()
+            userStringFunctions.removeAll()
+            redimAllowedAfterClear.removeAll()
         }
 
         elog("[CLEAR] Après : num=\(variables.count), arrNum=\(arrays.count), str=\(varText.count), arrStr=\(stringArrays.count), gosub=\(gosubStack.count), for=\(forStack.count)")
     }
+
+
 
     private func splitDataValues(_ s: String) -> [String] {
         var out: [String] = []
@@ -3799,10 +4329,7 @@ class BasicInterpreter: ObservableObject  {
     }
 
     // MARK: - Utilitaires parsing simples
-    private func isCall(_ s: String, _ name: String) -> Bool {
-        let u = s.trimmingCharacters(in: .whitespaces).uppercased()
-        return u.hasPrefix(name + "(") && u.hasSuffix(")")
-    }
+    
     // Sépare au niveau top les segments autour de ^ en ignorant guillemets et parenthèses.
     // Pas de vérif "avant/après identifiants" (contrairement à splitTopLevel).
     private func splitTopLevelByCaret(_ s: String) -> [String]? {
@@ -3856,89 +4383,7 @@ class BasicInterpreter: ObservableObject  {
 
     // MARK: - Evaluation des fonctions numériques MSX
     // Retourne Double si s est une fonction numérique reconnue, sinon nil (on laisse le flux normal)
-    private func tryEvalMsxNumericFunction(_ s: String) -> Double? {
-        let trimmed = s.trimmingCharacters(in: .whitespaces)
-        let up = trimmed.uppercased()
-
-        func inner(_ name: String) -> String? {
-            guard isCall(trimmed, name) else { return nil }
-            let start = trimmed.index(trimmed.firstIndex(of: "(")!, offsetBy: 1)
-            let end = trimmed.index(before: trimmed.endIndex) // ')'
-            return String(trimmed[start..<end])
-        }
-
-        // Helper pour 1 arg
-        func oneArg(_ name: String, _ op: (Double) -> Double?) -> Double? {
-            guard let ins = inner(name) else { return nil }
-            let aStr = ins.trimmingCharacters(in: .whitespaces)
-            elog("[num] \(name)(...) détecté, arg brut='\(aStr)'")
-            let aEval = evaluateExpression(aStr)
-            elog("[num] \(name) arg évalué='\(aEval)'")
-            guard let a = toDoubleOrNil(aEval) else { elog("[num] \(name) arg NON numérique"); return nil }
-            return op(a)
-        }
-
-        // ABS
-        if up.hasPrefix("ABS(") {
-            return oneArg("ABS") { a in abs(a) }
-        }
-        // SGN
-        if up.hasPrefix("SGN(") {
-            return oneArg("SGN") { a in a > 0 ? 1 : (a < 0 ? -1 : 0) }
-        }
-        // INT : plancher (vers -infini)
-        if up.hasPrefix("INT(") {
-            return oneArg("INT") { a in floor(a) }
-        }
-        // FIX : troncature vers 0
-        if up.hasPrefix("FIX(") {
-            return oneArg("FIX") { a in a < 0 ? ceil(a) : floor(a) }
-        }
-        // SQR : x >= 0 sinon "Illegal function call" MSX
-        if up.hasPrefix("SQR(") {
-            return oneArg("SQR") { a in
-                if a < 0 {
-                    elog("[num] SQR: Illegal function call (a<0)")
-                    // On peut propager une erreur via ta mécanique, ici on renvoie NaN pour signaler
-                    return Double.nan
-                }
-                return sqrt(a)
-            }
-        }
-        // RND
-        if up.hasPrefix("RND(") {
-            return oneArg("RND") { a in msxRND(a) }
-        }
-        // SIN/COS/TAN  (radians, MSX)
-        if up.hasPrefix("SIN(") {
-            return oneArg("SIN") { a in sin(a) }
-        }
-        if up.hasPrefix("COS(") {
-            return oneArg("COS") { a in cos(a) }
-        }
-        if up.hasPrefix("TAN(") {
-            return oneArg("TAN") { a in tan(a) }
-        }
-        // EXP/LOG (LOG = ln)
-        if up.hasPrefix("EXP(") {
-            return oneArg("EXP") { a in exp(a) }
-        }
-        if up.hasPrefix("LOG(") {
-            return oneArg("LOG") { a in
-                if a <= 0 {
-                    elog("[num] LOG: Illegal function call (a<=0)")
-                    return Double.nan
-                }
-                return log(a)
-            }
-        }
-        // ATN
-        if up.hasPrefix("ATN(") {
-            return oneArg("ATN") { a in atan(a) }
-        }
-
-        return nil
-    }
+    
     private func convertRadixLiteralsOutsideQuotes(_ s: String) -> String {
         let chars = Array(s)
         var i = 0
@@ -4279,5 +4724,79 @@ class BasicInterpreter: ObservableObject  {
         let clear = rest.contains(",CLEAR")
         return (name, clear)
     }
+    
+    
+    /// Protège les littéraux "..." pendant une transformation, puis les réinjecte.
+    /// - Exemple: withStringLiteralsShielded(s) { $0.replacingOccurrences(of: "=", with: "==") }
+    func withStringLiteralsShielded(_ s: String, _ transform: (String) -> String) -> String {
+        var holes: [String] = []
+        var out = ""
+        var i = s.startIndex
+
+        while i < s.endIndex {
+            let ch = s[i]
+            if ch == "\"" {
+                // On tente d’extraire un littéral "..." avec support des guillemets doublés ("")
+                var j = s.index(after: i)
+                var buf = ""
+                var foundClosing = false
+
+                while j < s.endIndex {
+                    let c = s[j]
+                    if c == "\"" {
+                        // Si guillemet doublé "", on ajoute un " au buffer et on continue
+                        let next = s.index(after: j)
+                        if next < s.endIndex, s[next] == "\"" {
+                            buf.append("\"")
+                            j = s.index(after: next) // on saute les deux guillemets
+                            continue
+                        } else {
+                            // guillemet fermant
+                            foundClosing = true
+                            break
+                        }
+                    } else {
+                        buf.append(c)
+                        j = s.index(after: j)
+                    }
+                }
+
+                if !foundClosing {
+                    // Pas de guillemet fermant → on NE shield PAS, on recopie la fin telle quelle et on sort.
+                    out.append(contentsOf: s[i...])
+                    i = s.endIndex
+                    break
+                }
+
+                // On a un littéral bien formé: stocke son contenu sans les guillemets
+                holes.append(buf)
+                out += "§§STR\(holes.count - 1)§§"
+
+                // Avance i juste après le guillemet fermant
+                i = s.index(after: j)
+            } else {
+                out.append(ch)
+                i = s.index(after: i)
+            }
+        }
+
+        // Transformer uniquement la partie hors guillemets
+        out = transform(out)
+
+        // Réinjecter les littéraux protégés (en remettant les guillemets)
+        for k in holes.indices {
+            out = out.replacingOccurrences(of: "§§STR\(k)§§", with: "\"\(holes[k])\"")
+        }
+        return out
+    }
+
+    // Consomme l’autorisation éventuelle de re-DIM au 1er accès post-CLEAR
+    private func consumeRedimAllowanceIfNeeded(_ rawName: String) {
+        let name = rawName.uppercased()
+        if redimAllowedAfterClear.remove(name) != nil {
+            elog("[CLEAR/JOKER] Joker consommé par 1er accès à \(name)")
+        }
+    }
+
 
 }
