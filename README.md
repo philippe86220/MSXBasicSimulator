@@ -9,6 +9,7 @@
 ## Sommaire
 - [Résumé](#résumé)
 - [Annexe technique](#annexe-technique-fonctionnement-interne-détaillé)
+- [Voir l’exemple « Jeu du pendu » ⤵](#pendu)
 - [Captures d’écran](#captures-décran)
 - [Licence](#licence)
 
@@ -91,9 +92,7 @@ Ok
 - `DEF FNx$(...)` (chaîne)
 
 ### Différences avec MSX BASIC 1.0
-- Tous les nombres sont représentés en `Double` (pas de `SINGLE`/`INTEGER`).  
-- `PRINT` : zones de 14 colonnes, espace de signe pour positifs.  
-- `CLEAR` : autorise un re-`DIM` unique après exécution.  
+- Tous les nombres sont représentés en `Double` (pas de `SINGLE`/`INTEGER`).    
 - `CLOAD`/`SAVE` : sauvegarde fichiers `.bas` dans le système local.  
 - `SAVEF`/`LOADF` : snapshot JSON de l’environnement.  
 
@@ -157,6 +156,60 @@ Programme :
 - Pas de `STOP` (qui sur MSX permettait BREAK + reprise CONT).
 - Pas de graphismes ni de son.
 
+### Exemple : le jeu du pendu <a id="pendu"></a>
+
+```basic
+10 CLS
+20 PRINT "PENDU - MSXBasicSimulator"
+30 X=RND(-TIME)          ' seed pseudo-aléatoire à partir de TIME (secondes)
+40 RESTORE
+50 READ C                ' C = nombre de mots
+60 DIM W$(C-1)           ' bornes inclusives -> 0..C-1
+70 FOR I=0 TO C-1
+80 READ W$(I)
+90 NEXT I
+100 GOSUB 200            ' lance une partie
+110 PRINT : INPUT "Rejouer (O/N)";R$
+120 IF R$="O" OR R$="o" THEN GOSUB 200 : GOTO 110
+130 END
+
+200 '---- Nouvelle partie ------------------------------------------------
+210 I=INT(RND(1)*C)      ' mot aléatoire 0..C-1
+220 S$=W$(I)             ' mot secret
+230 L=LEN(S$)
+240 MASK$=STRING$(L,"-") ' masque "-----"
+250 MAUVAIS=0
+260 GOSUB 300
+270 RETURN
+
+300 '---- Boucle de jeu --------------------------------------------------
+310 PRINT : PRINT "Mot: ";MASK$
+320 IF MASK$=S$ THEN PRINT "Bravo, gagne !": RETURN
+330 IF MAUVAIS>=6 THEN PRINT "Perdu... Mot etait: ";S$ : RETURN
+340 INPUT "Lettre ?";A$
+350 IF A$="" THEN 340
+360 A$=LEFT$(A$,1)       ' on ne garde qu'un caractère
+370 IF A$>="a" AND A$<="z" THEN A$=CHR$(ASC(A$)-32)  ' vers majuscules
+380 OLD$=MASK$
+390 GOSUB 1400           ' révèle la lettre si présente
+400 IF MASK$=OLD$ THEN MAUVAIS=MAUVAIS+1 : PRINT "Rate (";MAUVAIS;"/6)" ELSE PRINT "Bien !"
+410 GOTO 310
+
+1400 '---- Sous-routine de révélation -----------------------------------
+1410 NOUVEAU$=""
+1420 FOR J=1 TO L
+1430 C$=MID$(S$,J,1)
+1440 M$=MID$(MASK$,J,1)
+1450 IF C$=A$ THEN NOUVEAU$=NOUVEAU$+A$ ELSE NOUVEAU$=NOUVEAU$+M$
+1460 NEXT J
+1470 MASK$=NOUVEAU$
+1480 RETURN
+
+9000 '---- Dictionnaire --------------------------------------------------
+9010 DATA 10
+9020 DATA "MSX","SWIFT","BASIC","ARDUINO","EMULATEUR"
+9030 DATA "FONCTION","VARIABLE","TABLEAU","CHAINE","BOUCLE"
+```
 ---
 
 ## Captures d’écran
