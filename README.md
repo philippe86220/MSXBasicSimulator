@@ -93,7 +93,7 @@ Ok
 
 ### Différences avec MSX BASIC 1.0
 - Tous les nombres sont représentés en `Double` (pas de `SINGLE`/`INTEGER`).    
-- `CLOAD`/`SAVE` : sauvegarde fichiers `.bas` dans le système local.  
+- `CLOAD`/`CSAVE` : sauvegarde fichiers `.bas` dans le système local.  
 - `SAVEF`/`LOADF` : snapshot JSON de l’environnement.  
 
 ---
